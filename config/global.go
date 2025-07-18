@@ -88,6 +88,10 @@ func GetDaemonLogRotationSize() int {
 	return globalConfig.origin.DaemonConfig.LogRotationSize
 }
 
+func GetNydusdConfigPath() string {
+	return globalConfig.origin.DaemonConfig.NydusdConfigPath
+}
+
 func GetDaemonThreadsNumber() int {
 	return globalConfig.origin.DaemonConfig.ThreadsNumber
 }

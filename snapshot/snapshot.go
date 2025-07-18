@@ -14,14 +14,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
+	"github.com/pkg/errors"
 	"github.com/containerd/nydus-snapshotter/config"
 	"github.com/containerd/nydus-snapshotter/config/daemonconfig"
 	"github.com/containerd/nydus-snapshotter/pkg/rafs"
@@ -297,6 +296,50 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 		cleanupOnClose:       cfg.CleanupOnClose,
 	}, nil
 }
+
+// loadOverlayPaths reads overlay configuration from nydusd config file and returns the exact paths
+func loadOverlayPaths() (upperPath, workPath string) {
+	configPath := config.GetNydusdConfigPath()
+	log.L.Infof("loadOverlayPaths: configPath = %s", configPath)
+	if configPath == "" {
+		log.L.Infof("loadOverlayPaths: no config path found, using default overlay paths")
+		return "", ""
+	}
+
+	// Try to load as fuse config (most common case)
+	fuseConfig, err := daemonconfig.LoadFuseConfig(configPath)
+	if err != nil {
+		log.L.Warnf("loadOverlayPaths: failed to load fuse config from %s: %v", configPath, err)
+		return "", ""
+	}
+
+	if fuseConfig.SnapshotterOverlay != nil {
+		// Use the exact paths from snapshotter_overlay configuration
+		upperPath = fuseConfig.SnapshotterOverlay.UpperDir
+		workPath = fuseConfig.SnapshotterOverlay.WorkDir
+		log.L.Infof("loadOverlayPaths: loaded snapshotter_overlay paths - upperDir=%s, workDir=%s", upperPath, workPath)
+	} else {
+		log.L.Infof("loadOverlayPaths: no snapshotter_overlay configuration found in config")
+	}
+
+	return upperPath, workPath
+}
+
+// hasOverlayConfiguration checks if overlay configuration exists in nydusd config
+func hasOverlayConfiguration() bool {
+	configPath := config.GetNydusdConfigPath()
+	if configPath == "" {
+		return false
+	}
+
+	fuseConfig, err := daemonconfig.LoadFuseConfig(configPath)
+	if err != nil {
+		return false
+	}
+
+	return fuseConfig.SnapshotterOverlay != nil && fuseConfig.SnapshotterOverlay.UpperDir != "" && fuseConfig.SnapshotterOverlay.WorkDir != ""
+}
+
 
 func (o *snapshotter) Cleanup(ctx context.Context) error {
 	log.L.Debugf("[Cleanup] snapshots")
@@ -699,6 +742,7 @@ func (o *snapshotter) upperPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "fs")
 }
 
+
 // Get the rootdir of nydus image file system contents.
 func (o *snapshotter) lowerPath(id string) (mnt string, err error) {
 	if mnt, err = o.fs.MountPoint(id); err == nil {
@@ -713,6 +757,7 @@ func (o *snapshotter) lowerPath(id string) (mnt string, err error) {
 func (o *snapshotter) workPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "work")
 }
+
 
 func (o *snapshotter) findReferrerLayer(ctx context.Context, key string) (string, snapshots.Info, error) {
 	return snapshot.IterateParentSnapshots(ctx, o.ms, key, func(_ string, info snapshots.Info) bool {
@@ -803,11 +848,11 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 }
 
 func (o *snapshotter) mergeTarfs(ctx context.Context, s storage.Snapshot, pID string, pInfo snapshots.Info) error {
-	if err := o.fs.MergeTarfsLayers(s, func(id string) string { return o.upperPath(id) }); err != nil {
+	if err := o.fs.MergeTarfsLayers(s, o.upperPath); err != nil {
 		return errors.Wrapf(err, "tarfs merge fail %s", pID)
 	}
 	if config.GetTarfsExportEnabled() {
-		updateFields, err := o.fs.ExportBlockData(s, false, pInfo.Labels, func(id string) string { return o.upperPath(id) })
+		updateFields, err := o.fs.ExportBlockData(s, false, pInfo.Labels, o.upperPath)
 		if err != nil {
 			return errors.Wrap(err, "export tarfs as block image")
 		}
@@ -836,10 +881,29 @@ func bindMount(source, roFlag string) []mount.Mount {
 }
 
 func overlayMount(options []string) []mount.Mount {
+	// Check if we should use fuse-overlayfs based on upperdir
+	upperDir := ""
+	for _, option := range options {
+		if strings.HasPrefix(option, "upperdir=") {
+			upperDir = strings.TrimPrefix(option, "upperdir=")
+			break
+		}
+	}
+
+	mountType := "overlay"
+	mountSource := "overlay"
+	
+	if upperDir != "" && shouldUseFuseOverlayfs(upperDir) {
+		// Use fuse-overlayfs for FUSE upper directories
+		mountType = "fuse.fuse-overlayfs"
+		mountSource = "fuse-overlayfs"
+		log.L.Infof("Using fuse-overlayfs for mount due to FUSE upper directory")
+	}
+
 	return []mount.Mount{
 		{
-			Type:    "overlay",
-			Source:  "overlay",
+			Type:    mountType,
+			Source:  mountSource,
 			Options: options,
 		},
 	}
@@ -944,8 +1008,11 @@ func (o *snapshotter) mountRemote(ctx context.Context, labels map[string]string,
 	if o.enableKataVolume {
 		return o.mountWithKataVolume(ctx, id, overlayOptions, key)
 	}
-	// Add `extraoption` if NydusOverlayFS is enable or daemonMode is `None`
-	if o.enableNydusOverlayFS || config.GetDaemonMode() == config.DaemonModeNone {
+	// Add `extraoption` if NydusOverlayFS is enable or daemonMode is `None` or overlay configuration exists
+	if o.enableNydusOverlayFS || config.GetDaemonMode() == config.DaemonModeNone || hasOverlayConfiguration() {
+		if hasOverlayConfiguration() {
+			log.G(ctx).Infof("Automatically enabling nydus-overlayfs due to overlay configuration in nydusd config")
+		}
 		return o.remoteMountWithExtraOptions(ctx, s, id, overlayOptions)
 	}
 	return overlayMount(overlayOptions), nil

@@ -99,8 +99,43 @@ func (o *snapshotter) remoteMountWithExtraOptions(ctx context.Context, s storage
 	opt := fmt.Sprintf("extraoption=%s", base64.StdEncoding.EncodeToString(no))
 	overlayOptions = append(overlayOptions, opt)
 
+	// Replace upperdir/workdir with PVC paths if configured
+	upperPath, workPath := loadOverlayPaths()
+	if upperPath != "" && workPath != "" && s.Kind == snapshots.KindActive {
+		// Remove existing upperdir/workdir options
+		var newOptions []string
+		for _, option := range overlayOptions {
+			if !strings.HasPrefix(option, "upperdir=") && !strings.HasPrefix(option, "workdir=") {
+				newOptions = append(newOptions, option)
+			}
+		}
+		// Add PVC paths
+		newOptions = append(newOptions, 
+			fmt.Sprintf("upperdir=%s", upperPath),
+			fmt.Sprintf("workdir=%s", workPath),
+		)
+		overlayOptions = newOptions
+		log.G(ctx).Infof("Using PVC paths for overlay mount - upperdir=%s, workdir=%s", upperPath, workPath)
+	}
+
+	// Check if we should use fuse-overlayfs based on upperdir
+	upperDir := ""
+	for _, option := range overlayOptions {
+		if strings.HasPrefix(option, "upperdir=") {
+			upperDir = strings.TrimPrefix(option, "upperdir=")
+			break
+		}
+	}
+
 	mountType := "fuse.nydus-overlayfs"
-	if o.nydusOverlayFSPath != "" {
+	mountSource := KataVirtualVolumeDefaultSource
+	
+	if upperDir != "" && shouldUseFuseOverlayfs(upperDir) {
+		// Use fuse-overlayfs for FUSE upper directories
+		mountType = "fuse.fuse-overlayfs"
+		mountSource = "fuse-overlayfs"
+		log.G(ctx).Infof("Using fuse-overlayfs for mount due to FUSE upper directory")
+	} else if o.nydusOverlayFSPath != "" {
 		log.G(ctx).Infof("Using nydus-overlayfs from path: %s", o.nydusOverlayFSPath)
 		mountType = fmt.Sprintf("fuse.%s", o.nydusOverlayFSPath)
 	}
@@ -108,7 +143,7 @@ func (o *snapshotter) remoteMountWithExtraOptions(ctx context.Context, s storage
 	return []mount.Mount{
 		{
 			Type:    mountType,
-			Source:  KataVirtualVolumeDefaultSource,
+			Source:  mountSource,
 			Options: overlayOptions,
 		},
 	}, nil

@@ -301,7 +301,10 @@ func (fs *Filesystem) Mount(ctx context.Context, snapshotID string, labels map[s
 			daemonconfig.Bootstrap: bootstrap,
 			daemonconfig.WorkDir:   workDir,
 			daemonconfig.CacheDir:  cacheDir,
+			// Pass base config path so overlay config can be read fresh for each daemon
+			daemonconfig.BaseConfigPath: config.GetNydusdConfigPath(),
 		}
+
 		cfg := deepcopy.Copy(*fsManager.DaemonConfig).(daemonconfig.DaemonConfig)
 		err = daemonconfig.SupplementDaemonConfig(cfg, imageID, snapshotID, false, labels, params)
 		if err != nil {
@@ -704,3 +707,4 @@ func (fs *Filesystem) GetDaemonByID(id string) (*daemon.Daemon, error) {
 	}
 	return nil, errdefs.ErrNotFound
 }
+
