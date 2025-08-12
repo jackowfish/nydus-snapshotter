@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -25,14 +27,70 @@ var (
 	BuildTime = "unknown"
 )
 
+// ExtraOption represents the nydus-specific mount information
+type ExtraOption struct {
+	Source      string `json:"source"`
+	Config      string `json:"config"`
+	Snapshotdir string `json:"snapshotdir"`
+	Version     string `json:"fs_version"`
+}
+
+// NydusdConfig represents the nydusd configuration to check for overlay settings
+type NydusdConfig struct {
+	Overlay *OverlayConfig `json:"overlay,omitempty"`
+}
+
+// OverlayConfig represents overlay filesystem configuration
+type OverlayConfig struct {
+	UpperDir string `json:"upper_dir"`
+	WorkDir  string `json:"work_dir"`
+}
+
 /*
 containerd run fuse.mount format: nydus-overlayfs overlay /tmp/ctd-volume107067851
 -o lowerdir=/foo/lower2:/foo/lower1,upperdir=/foo/upper,workdir=/foo/work,extraoption={...},dev,suid]
 */
 type mountArgs struct {
-	fsType  string
-	target  string
-	options []string
+	fsType      string
+	target      string
+	options     []string
+	extraOption *ExtraOption
+}
+
+// parseExtraOption extracts and parses the extraoption from mount options
+func parseExtraOption(options []string) *ExtraOption {
+	for _, opt := range options {
+		if strings.HasPrefix(opt, extraOptionKey) {
+			extraOptionB64 := strings.TrimPrefix(opt, extraOptionKey)
+			extraOptionJSON, err := base64.StdEncoding.DecodeString(extraOptionB64)
+			if err != nil {
+				log.Printf("Failed to decode extraoption: %v", err)
+				return nil
+			}
+			
+			var extraOption ExtraOption
+			if err := json.Unmarshal(extraOptionJSON, &extraOption); err != nil {
+				log.Printf("Failed to unmarshal extraoption: %v", err)
+				return nil
+			}
+			
+			return &extraOption
+		}
+	}
+	return nil
+}
+
+// hasOverlayInConfig checks if overlay configuration is present in nydusd config
+func hasOverlayInConfig(config string) bool {
+	var nydusdConfig NydusdConfig
+	if err := json.Unmarshal([]byte(config), &nydusdConfig); err != nil {
+		log.Printf("Failed to parse nydusd config: %v", err)
+		return false
+	}
+	
+	return nydusdConfig.Overlay != nil && 
+		   nydusdConfig.Overlay.UpperDir != "" && 
+		   nydusdConfig.Overlay.WorkDir != ""
 }
 
 func parseArgs(args []string) (*mountArgs, error) {
@@ -48,7 +106,12 @@ func parseArgs(args []string) (*mountArgs, error) {
 	}
 
 	if args[2] == "-o" && len(args[3]) != 0 {
-		for _, opt := range strings.Split(args[3], ",") {
+		allOptions := strings.Split(args[3], ",")
+		
+		// Parse extraoption before filtering
+		margs.extraOption = parseExtraOption(allOptions)
+		
+		for _, opt := range allOptions {
 			// filter Nydus specific options
 			if strings.HasPrefix(opt, extraOptionKey) || strings.HasPrefix(opt, kataVolumeOptionKey) {
 				continue
@@ -56,8 +119,8 @@ func parseArgs(args []string) (*mountArgs, error) {
 			margs.options = append(margs.options, opt)
 		}
 	}
-	if len(margs.options) == 0 {
-		return nil, errors.New("empty overlayfs mount options")
+	if len(margs.options) == 0 && margs.extraOption == nil {
+		return nil, errors.New("empty overlayfs mount options and no extraoption")
 	}
 
 	return margs, nil
@@ -112,6 +175,21 @@ func run(args cli.Args) error {
 		return errors.Wrap(err, "parse mount options")
 	}
 
+	// Check if overlay configuration is present in extraoption
+	if margs.extraOption != nil && hasOverlayInConfig(margs.extraOption.Config) {
+		log.Printf("Detected overlay configuration in nydusd config - skipping syscall overlayfs mount")
+		log.Printf("Target: %s will be mounted by nydusd with native overlay support", margs.target)
+		
+		// Create target directory if it doesn't exist
+		if err := os.MkdirAll(margs.target, 0755); err != nil {
+			return errors.Wrapf(err, "failed to create target directory %s", margs.target)
+		}
+		
+		// Return success - let nydusd handle the mounting with its native overlay support
+		return nil
+	}
+
+	// Fall back to regular overlayfs syscall mount for cases without overlay config
 	flags, data := parseOptions(margs.options)
 	err = syscall.Mount(margs.fsType, margs.target, margs.fsType, uintptr(flags), data)
 	if err != nil {
