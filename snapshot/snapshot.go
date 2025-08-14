@@ -874,6 +874,16 @@ func fuseOverlayMount(options []string) []mount.Mount {
 	}
 }
 
+func nydusOverlayMount(options []string) []mount.Mount {
+	return []mount.Mount{
+		{
+			Type:    "fuse.nydus-overlayfs",
+			Source:  "fuse.nydus-overlayfs",
+			Options: options,
+		},
+	}
+}
+
 // Handle proxy mount which the snapshot has been prepared by other snapshotter, mainly used for pause image in containerd
 func (o *snapshotter) mountProxy(ctx context.Context, s storage.Snapshot) ([]mount.Mount, error) {
 	var overlayOptions []string
@@ -1250,9 +1260,12 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 	log.G(ctx).Infof("Using PVC paths for overlay mount - upperdir=%s, workdir=%s, type=%s", upperDir, workDir, overlayType)
 
 	// Choose mount type based on overlay-type annotation
-	if overlayType == "overlayfs" {
+	switch overlayType {
+	case "overlayfs":
 		return overlayMount(newOptions)
-	} else {
+	case "nydus-overlayfs":
+		return nydusOverlayMount(newOptions)
+	default:
 		// Default to fuse-overlayfs for backwards compatibility
 		return fuseOverlayMount(newOptions)
 	}
