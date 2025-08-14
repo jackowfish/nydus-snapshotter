@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/nydus-snapshotter/config/daemonconfig"
 	"github.com/containerd/nydus-snapshotter/pkg/rafs"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -863,6 +864,16 @@ func overlayMount(options []string) []mount.Mount {
 	}
 }
 
+func fuseOverlayMount(options []string) []mount.Mount {
+	return []mount.Mount{
+		{
+			Type:    "fuse.fuse-overlayfs",
+			Source:  "fuse-overlayfs",
+			Options: options,
+		},
+	}
+}
+
 // Handle proxy mount which the snapshot has been prepared by other snapshotter, mainly used for pause image in containerd
 func (o *snapshotter) mountProxy(ctx context.Context, s storage.Snapshot) ([]mount.Mount, error) {
 	var overlayOptions []string
@@ -961,6 +972,7 @@ func (o *snapshotter) mountRemote(ctx context.Context, labels map[string]string,
 
 	// Check for PVC annotation and replace overlay options if found
 	if o.ctrd != nil && s.Kind == snapshots.KindActive {
+		log.G(ctx).Infof("Checking for PVC mount annotation")
 		if mounts := o.tryPVMount(ctx, key, overlayOptions); mounts != nil {
 			return mounts, nil
 		}
@@ -1174,31 +1186,54 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 		return nil
 	}
 
-	basePath, pvcPath, err := o.getPodPVCPathFromContainer(ctx, container, "nydus/use-pvc-upper")
+	pvcPath, overlayType, err := o.getPodAnnotationsFromContainer(ctx, container)
 	if err != nil {
-		log.G(ctx).Debugf("Failed to query pod PVC path: %v", err)
 		return nil
 	}
 
-	if basePath == "" || pvcPath == "" {
+	if pvcPath == "" {
 		return nil
 	}
 
-	log.G(ctx).Infof("Found PVC annotation basePath=%s, pvcPath=%s, replacing overlay paths", basePath, pvcPath)
+	log.G(ctx).Infof("Using PVC path from annotation: %s, overlay type: %s", pvcPath, overlayType)
 
-	// Create upperdir and workdir paths under the PVC mount
-	upperDir := filepath.Join(pvcPath, "upper")
-	workDir := filepath.Join(pvcPath, "work")
+	// Separate container-accessible path from host-native path
+	var containerPvcPath, hostNativePvcPath string
+	if strings.HasPrefix(pvcPath, "/host") {
+		// Path found via /host/proc/mounts - we have the host-native path
+		hostNativePvcPath = strings.TrimPrefix(pvcPath, "/host")
+		containerPvcPath = pvcPath // Keep /host prefix for creating directories
+	} else {
+		// Path doesn't have /host prefix (shouldn't happen in our case, but handle it)
+		hostNativePvcPath = pvcPath
+		containerPvcPath = pvcPath
+	}
 
-	// Ensure upperdir and workdir exist
-	if err := os.MkdirAll(upperDir, 0755); err != nil {
-		log.G(ctx).WithError(err).Errorf("Failed to create upperdir %s", upperDir)
+	// Create upperdir and workdir paths under the PVC mount using container-accessible path
+	containerUpperDir := filepath.Join(containerPvcPath, "upper")
+	containerWorkDir := filepath.Join(containerPvcPath, "work")
+
+	// Ensure upperdir and workdir exist on the host filesystem
+	if err := os.MkdirAll(containerUpperDir, 0755); err != nil {
+		log.G(ctx).WithError(err).Errorf("Failed to create upperdir %s", containerUpperDir)
 		return nil
 	}
-	if err := os.MkdirAll(workDir, 0711); err != nil {
-		log.G(ctx).WithError(err).Errorf("Failed to create workdir %s", workDir)
+	if err := os.MkdirAll(containerWorkDir, 0711); err != nil {
+		log.G(ctx).WithError(err).Errorf("Failed to create workdir %s", containerWorkDir)
 		return nil
 	}
+
+	// Verify directories were created successfully
+	if _, err := os.Stat(containerUpperDir); err != nil {
+		return nil
+	}
+	if _, err := os.Stat(containerWorkDir); err != nil {
+		return nil
+	}
+	
+	// Use host-native paths for overlay mount options
+	upperDir := filepath.Join(hostNativePvcPath, "upper")
+	workDir := filepath.Join(hostNativePvcPath, "work")
 
 	// Remove existing upperdir/workdir options and add PVC-based paths
 	var newOptions []string
@@ -1212,19 +1247,19 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 		fmt.Sprintf("workdir=%s", workDir),
 	)
 
-	log.G(ctx).Infof("Using PVC PVC paths for overlay mount - upperdir=%s, workdir=%s", upperDir, workDir)
+	log.G(ctx).Infof("Using PVC paths for overlay mount - upperdir=%s, workdir=%s, type=%s", upperDir, workDir, overlayType)
 
-	return []mount.Mount{
-		{
-			Type:    "fuse.fuse-overlayfs",
-			Source:  "fuse-overlayfs",
-			Options: newOptions,
-		},
+	// Choose mount type based on overlay-type annotation
+	if overlayType == "overlayfs" {
+		return overlayMount(newOptions)
+	} else {
+		// Default to fuse-overlayfs for backwards compatibility
+		return fuseOverlayMount(newOptions)
 	}
 }
 
-// getPodPVCPathFromContainer finds the actual PVC path for PVC overlay based on container and pod annotation
-func (o *snapshotter) getPodPVCPathFromContainer(ctx context.Context, container *containers.Container, annotationKey string) (basePath, actualPVCPath string, err error) {
+// getPodAnnotationsFromContainer extracts PVC path and overlay type from pod annotations
+func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, container *containers.Container) (pvcPath, overlayType string, err error) {
 	if container == nil {
 		return "", "", nil
 	}
@@ -1258,57 +1293,91 @@ func (o *snapshotter) getPodPVCPathFromContainer(ctx context.Context, container 
 		return "", "", errors.Wrapf(err, "failed to get pod %s/%s", podNamespace, podName)
 	}
 
-	// Check if pod has the PVC annotation
-	basePathValue, exists := pod.Annotations[annotationKey]
-	if !exists || basePathValue == "" {
+	// Check if use-pvc-upper is enabled (boolean)
+	usePvcUpper := pod.Annotations["nydus/use-pvc-upper"]
+	if usePvcUpper != "true" {
 		return "", "", nil
 	}
 
-	// Find the PVC volume in the pod
-	var pvcName string
+	// Find PVC mount directory
+	pvcPath, err = o.findPVCMountPath(ctx, pod, clientset)
+	if err != nil {
+		return "", "", errors.Wrap(err, "failed to find PVC mount path")
+	}
+	if pvcPath == "" {
+		return "", "", nil
+	}
+
+	// Get overlay type from annotation, default to fuse-overlayfs
+	overlayType = pod.Annotations["nydus/overlay-type"]
+	if overlayType == "" {
+		overlayType = "fuse-overlayfs" // default
+	}
+	
+	return pvcPath, overlayType, nil
+}
+
+// findPVCMountPath finds the PVC mount directory by searching for mountpoints with PVC volume names
+func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, clientset *kubernetes.Clientset) (string, error) {
+	// Extract PVC names from pod volumes and get their bound volume names
+	var volumeNames []string
 	for _, volume := range pod.Spec.Volumes {
 		if volume.PersistentVolumeClaim != nil {
-			pvcName = volume.PersistentVolumeClaim.ClaimName
-			break
+			pvcName := volume.PersistentVolumeClaim.ClaimName
+			
+			// Get the actual volume name from the PVC using the passed clientset
+			pvc, err := clientset.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, pvcName, metav1.GetOptions{})
+			if err != nil {
+				continue
+			}
+			
+			if pvc.Spec.VolumeName != "" {
+				volumeNames = append(volumeNames, pvc.Spec.VolumeName)
+			}
 		}
 	}
 	
-	if pvcName == "" {
-		return "", "", errors.New("no PVC found in pod")
-	}
-
-	// Get PVC details to find the PV name
-	pvc, err := clientset.CoreV1().PersistentVolumeClaims(podNamespace).Get(context.Background(), pvcName, metav1.GetOptions{})
-	if err != nil {
-		return "", "", errors.Wrapf(err, "failed to get PVC %s", pvcName)
-	}
-
-	pvName := pvc.Spec.VolumeName
-	if pvName == "" {
-		return "", "", errors.New("PVC is not bound to a PV")
-	}
-
-	// Find the actual directory under basePath that starts with pvName
-	actualPVCPath, err = o.findPVCDirectory(basePathValue, pvName)
-	if err != nil {
-		return "", "", errors.Wrapf(err, "failed to find PVC directory for PV %s", pvName)
+	if len(volumeNames) == 0 {
+		return "", nil // No bound volumes found
 	}
 	
-	return basePathValue, actualPVCPath, nil
-}
-
-// findPVCDirectory searches for a directory that starts with the given PV name
-func (o *snapshotter) findPVCDirectory(basePath, pvName string) (string, error) {
-	entries, err := os.ReadDir(basePath)
+	// Read /host/proc/mounts directly from host
+	mountsData, err := os.ReadFile("/host/proc/mounts")
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "failed to read /host/proc/mounts")
 	}
-
-	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), pvName) {
-			return filepath.Join(basePath, entry.Name()), nil
+	
+	// Parse mount data to find PVC mountpoints
+	lines := strings.Split(string(mountsData), "\n")
+	
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		
+		// Look for lines containing any volume name
+		for _, volumeName := range volumeNames {
+			if strings.Contains(line, volumeName) {
+				// Extract mount path (second field in /host/proc/mounts format)
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					mountPath := fields[1]
+					
+					// Check if the volume name is also in the mount path (preferred)
+					if strings.Contains(mountPath, volumeName) {
+						// Filter out containerd-related mount paths
+						if strings.Contains(mountPath, "containerd") {
+							continue
+						}
+						return mountPath, nil
+					} else {
+						continue // Volume name not in path, try next line
+					}
+				}
+			}
 		}
 	}
-
-	return "", errors.Errorf("no directory found starting with PV name %s in %s", pvName, basePath)
+	
+	return "", nil // No matching PVC mount found
 }
+
