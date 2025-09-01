@@ -345,14 +345,18 @@ func (sc *Controller) upgradeDaemons() func(w http.ResponseWriter, r *http.Reque
 				}
 			}
 
-			// TODO: why renaming?
-			err = os.Rename(c.NydusdPath, manager.NydusdBinaryPath)
-			if err != nil {
-				log.L.Errorf("Rename nydusd binary from %s to  %s failed, %v",
-					c.NydusdPath, manager.NydusdBinaryPath, err)
+			sourcePath := c.NydusdPath
+			destinationPath := manager.NydusdBinaryPath
+
+			if err = copyNydusdBinary(sourcePath, destinationPath); err != nil {
+				log.L.Errorf("Failed to copy nydusd binary from %s to %s: %v",
+					sourcePath, destinationPath, err)
 				statusCode = http.StatusInternalServerError
 				return
 			}
+
+			log.L.Infof("Successfully copy nydusd binary from %s to %s",
+				sourcePath, destinationPath)
 		}
 	}
 }
@@ -360,6 +364,10 @@ func (sc *Controller) upgradeDaemons() func(w http.ResponseWriter, r *http.Reque
 // Provide minimal parameters since most of it can be recovered by nydusd states.
 // Create a new daemon in Manger to take over the service.
 func (sc *Controller) upgradeNydusDaemon(d *daemon.Daemon, c upgradeRequest, manager *manager.Manager) error {
+	if d.Supervisor != nil {
+		return errors.New("should set recover policy to failover to enable hot upgrade")
+	}
+
 	log.L.Infof("Upgrading nydusd %s, request %v", d.ID(), c)
 
 	fs := sc.fs
@@ -384,14 +392,15 @@ func (sc *Controller) upgradeNydusDaemon(d *daemon.Daemon, c upgradeRequest, man
 		return err
 	}
 
-	su := manager.SupervisorSet.GetSupervisor(d.ID())
-	if err := su.SendStatesTimeout(time.Second * 10); err != nil {
+	if err := d.Supervisor.SendStatesTimeout(time.Second * 10); err != nil {
 		return errors.Wrap(err, "Send states")
 	}
 
 	if err := cmd.Start(); err != nil {
 		return errors.Wrap(err, "start process")
 	}
+
+	newDaemon.States.ProcessID = cmd.Process.Pid
 
 	if err := newDaemon.WaitUntilState(types.DaemonStateInit); err != nil {
 		return errors.Wrap(err, "wait until init state")
@@ -458,4 +467,38 @@ func buildNextAPISocket(cur string) (string, error) {
 
 	nextSocket := fmt.Sprintf("api%d.sock", num)
 	return nextSocket, nil
+}
+
+// copyNydusdBinary copies a file from sourcePath to destinationPath,
+// ensuring parent directories exist and setting 0755 permissions.
+// It overwrites the destination file if it already exists.
+func copyNydusdBinary(sourcePath, destinationPath string) error {
+	fileMode := os.FileMode(0755)
+
+	destDir := filepath.Dir(destinationPath)
+	if err := os.MkdirAll(destDir, fileMode); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %w", destDir, err)
+	}
+
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to open source file %s: %w", sourcePath, err)
+	}
+	defer sourceFile.Close()
+
+	destinationFile, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fileMode)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file %s: %w", destinationPath, err)
+	}
+	defer destinationFile.Close()
+
+	if _, err := io.Copy(destinationFile, sourceFile); err != nil {
+		return fmt.Errorf("failed to copy file contents from %s to %s: %w", sourcePath, destinationPath, err)
+	}
+
+	if err := os.Chmod(destinationPath, fileMode); err != nil {
+		return fmt.Errorf("failed to set permissions for %s to %s: %w", destinationPath, fileMode.String(), err)
+	}
+
+	return nil
 }
