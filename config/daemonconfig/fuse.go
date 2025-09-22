@@ -67,7 +67,10 @@ func (c *FuseDaemonConfig) Supplement(host, repo, _ string, params map[string]st
 	if repo != "" {
 		c.Device.Backend.Config.Repo = repo
 	}
-	c.Device.Cache.Config.WorkDir = params[CacheDir]
+	// Only override cache work directory if it's not already configured
+	if c.Device.Cache.Config.WorkDir == "" {
+		c.Device.Cache.Config.WorkDir = params[CacheDir]
+	}
 }
 
 func (c *FuseDaemonConfig) FillAuth(kc *auth.PassKeyChain) {
