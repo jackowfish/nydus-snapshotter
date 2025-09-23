@@ -9,10 +9,13 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -38,6 +41,7 @@ import (
 	"github.com/containerd/nydus-snapshotter/pkg/cgroup"
 	v2 "github.com/containerd/nydus-snapshotter/pkg/cgroup/v2"
 	"github.com/containerd/nydus-snapshotter/pkg/errdefs"
+	racache "github.com/containerd/nydus-snapshotter/pkg/rafs"
 	mgr "github.com/containerd/nydus-snapshotter/pkg/manager"
 	"github.com/containerd/nydus-snapshotter/pkg/metrics"
 	"github.com/containerd/nydus-snapshotter/pkg/metrics/collector"
@@ -1196,16 +1200,24 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 		return nil
 	}
 
-	pvcPath, overlayType, err := o.getPodAnnotationsFromContainer(ctx, container)
+	pvcPaths, overlayType, err := o.getPodAnnotationsFromContainer(ctx, container)
 	if err != nil {
 		return nil
 	}
 
-	if pvcPath == "" {
+	if len(pvcPaths) == 0 {
 		return nil
 	}
 
-	log.G(ctx).Infof("Using PVC path from annotation: %s, overlay type: %s", pvcPath, overlayType)
+	// Use first PVC for upper/work dirs, second PVC (if exists) for cache
+	pvcPath := pvcPaths[0]
+	var cachePvcPath string
+	if len(pvcPaths) > 1 {
+		cachePvcPath = pvcPaths[1]
+		log.G(ctx).Infof("Using dual PVC paths - data: %s, cache: %s", pvcPath, cachePvcPath)
+	} else {
+		log.G(ctx).Infof("Using single PVC path: %s, overlay type: %s", pvcPath, overlayType)
+	}
 
 	// Separate container-accessible path from host-native path
 	var containerPvcPath, hostNativePvcPath string
@@ -1259,6 +1271,14 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 
 	log.G(ctx).Infof("Using PVC paths for overlay mount - upperdir=%s, workdir=%s, type=%s", upperDir, workDir, overlayType)
 
+	// If we have a second PVC, bind mount the cache directory to it
+	if cachePvcPath != "" {
+		if err := o.bindMountCacheToPVC(ctx, key, cachePvcPath); err != nil {
+			log.G(ctx).WithError(err).Errorf("Failed to bind mount cache to PVC")
+			// Continue without the bind mount - daemon will use its default cache
+		}
+	}
+
 	// Choose mount type based on overlay-type annotation
 	switch overlayType {
 	case "overlayfs":
@@ -1271,54 +1291,54 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 	}
 }
 
-// getPodAnnotationsFromContainer extracts PVC path and overlay type from pod annotations
-func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, container *containers.Container) (pvcPath, overlayType string, err error) {
+// getPodAnnotationsFromContainer extracts PVC paths and overlay type from pod annotations
+func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, container *containers.Container) (pvcPaths []string, overlayType string, err error) {
 	if container == nil {
-		return "", "", nil
+		return nil, "", nil
 	}
 	
 	// Extract pod information from container labels
 	podName, ok := container.Labels["io.kubernetes.pod.name"]
 	if !ok {
-		return "", "", errors.New("container missing io.kubernetes.pod.name label")
+		return nil, "", errors.New("container missing io.kubernetes.pod.name label")
 	}
-	
+
 	podNamespace, ok := container.Labels["io.kubernetes.pod.namespace"]
 	if !ok {
-		return "", "", errors.New("container missing io.kubernetes.pod.namespace label")
+		return nil, "", errors.New("container missing io.kubernetes.pod.namespace label")
 	}
 
 	// Create in-cluster config
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 
 	// Create Kubernetes client
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 
 	// Get the specific pod directly
 	pod, err := clientset.CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
 	if err != nil {
-		return "", "", errors.Wrapf(err, "failed to get pod %s/%s", podNamespace, podName)
+		return nil, "", errors.Wrapf(err, "failed to get pod %s/%s", podNamespace, podName)
 	}
 
 	// Check if use-pvc-upper is enabled (boolean)
 	usePvcUpper := pod.Annotations["nydus/use-pvc-upper"]
 	if usePvcUpper != "true" {
-		return "", "", nil
+		return nil, "", nil
 	}
 
-	// Find PVC mount directory
-	pvcPath, err = o.findPVCMountPath(ctx, pod, clientset)
+	// Find PVC mount directories (now returns multiple)
+	pvcPaths, err = o.findPVCMountPaths(ctx, pod, clientset)
 	if err != nil {
-		return "", "", errors.Wrap(err, "failed to find PVC mount path")
+		return nil, "", errors.Wrap(err, "failed to find PVC mount paths")
 	}
-	if pvcPath == "" {
-		return "", "", nil
+	if len(pvcPaths) == 0 {
+		return nil, "", nil
 	}
 
 	// Get overlay type from annotation, default to fuse-overlayfs
@@ -1327,11 +1347,11 @@ func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, contai
 		overlayType = "fuse-overlayfs" // default
 	}
 	
-	return pvcPath, overlayType, nil
+	return pvcPaths, overlayType, nil
 }
 
-// findPVCMountPath finds the PVC mount directory by searching for mountpoints with PVC volume names
-func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, clientset *kubernetes.Clientset) (string, error) {
+// findPVCMountPaths finds all PVC mount directories by searching for mountpoints with PVC volume names
+func (o *snapshotter) findPVCMountPaths(ctx context.Context, pod *corev1.Pod, clientset *kubernetes.Clientset) ([]string, error) {
 	// Extract PVC names from pod volumes and get their bound volume names
 	var volumeNames []string
 	for _, volume := range pod.Spec.Volumes {
@@ -1351,23 +1371,24 @@ func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, cli
 	}
 	
 	if len(volumeNames) == 0 {
-		return "", nil // No bound volumes found
+		return nil, nil // No bound volumes found
 	}
-	
+
 	// Read /host/proc/mounts directly from host
 	mountsData, err := os.ReadFile("/host/proc/mounts")
 	if err != nil {
-		return "", errors.Wrap(err, "failed to read /host/proc/mounts")
+		return nil, errors.Wrap(err, "failed to read /host/proc/mounts")
 	}
-	
+
 	// Parse mount data to find PVC mountpoints
 	lines := strings.Split(string(mountsData), "\n")
-	
+	var foundPaths []string
+
 	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		
+
 		// Look for lines containing any volume name
 		for _, volumeName := range volumeNames {
 			if strings.Contains(line, volumeName) {
@@ -1375,22 +1396,156 @@ func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, cli
 				fields := strings.Fields(line)
 				if len(fields) >= 2 {
 					mountPath := fields[1]
-					
+
 					// Check if the volume name is also in the mount path (preferred)
 					if strings.Contains(mountPath, volumeName) {
 						// Filter out containerd-related mount paths
 						if strings.Contains(mountPath, "containerd") {
 							continue
 						}
-						return mountPath, nil
-					} else {
-						continue // Volume name not in path, try next line
+
+						// Add path with /host prefix for container access, unless it already has it
+						var pathToAdd string
+						if strings.HasPrefix(mountPath, "/host") {
+							// Path already has /host prefix, use as-is
+							pathToAdd = mountPath
+						} else {
+							// Add /host prefix for container access
+							pathToAdd = "/host" + mountPath
+						}
+
+						// Check if this path is already in our list (avoid duplicates)
+						alreadyAdded := false
+						for _, existing := range foundPaths {
+							if existing == pathToAdd {
+								alreadyAdded = true
+								break
+							}
+						}
+
+						if !alreadyAdded {
+							log.G(ctx).Infof("Found PVC mount: volume=%s, mountPath=%s", volumeName, mountPath)
+							foundPaths = append(foundPaths, pathToAdd)
+						}
+						break // Don't continue searching for this volume
 					}
 				}
 			}
 		}
 	}
-	
-	return "", nil // No matching PVC mount found
+
+	return foundPaths, nil
+}
+
+// bindMountCacheToPVC bind mounts the daemon's cache directory to the PVC path
+func (o *snapshotter) bindMountCacheToPVC(ctx context.Context, snapshotKey string, cachePvcPath string) error {
+	// Get the snapshot info to find the parent (nydus meta layer)
+	_, info, _, err := snapshot.GetSnapshotInfo(ctx, o.ms, snapshotKey)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get snapshot info for key %s", snapshotKey)
+	}
+
+	// Find the nydus meta parent
+	var metaSnapshotID string
+	if info.Parent != "" {
+		pID, pInfo, _, err := snapshot.GetSnapshotInfo(ctx, o.ms, info.Parent)
+		if err == nil && label.IsNydusMetaLayer(pInfo.Labels) {
+			metaSnapshotID = pID
+		}
+	}
+
+	if metaSnapshotID == "" {
+		log.G(ctx).Warnf("No nydus meta layer found for snapshot %s", snapshotKey)
+		return nil
+	}
+
+	// Get the rafs instance from cache
+	rafs := racache.RafsGlobalCache.Get(metaSnapshotID)
+	if rafs == nil {
+		return errors.Errorf("no rafs instance found for snapshot %s", metaSnapshotID)
+	}
+
+	// Get the daemon from the rafs instance
+	daemonID := rafs.DaemonID
+	if daemonID == "" {
+		return errors.Errorf("no daemon ID found for rafs instance %s", metaSnapshotID)
+	}
+
+	// Read the daemon's config to find the current cache directory
+	configFilePath := filepath.Join(config.GetConfigRoot(), daemonID, "config.json")
+	configData, err := os.ReadFile(configFilePath)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read daemon config file %s", configFilePath)
+	}
+
+	// Parse the config to find the cache work_dir
+	var configMap map[string]interface{}
+	if err := json.Unmarshal(configData, &configMap); err != nil {
+		return errors.Wrapf(err, "failed to parse daemon config")
+	}
+
+	var currentCacheDir string
+	if device, ok := configMap["device"].(map[string]interface{}); ok {
+		if cache, ok := device["cache"].(map[string]interface{}); ok {
+			if cacheConfig, ok := cache["config"].(map[string]interface{}); ok {
+				if workDir, ok := cacheConfig["work_dir"].(string); ok {
+					currentCacheDir = workDir
+				}
+			}
+		}
+	}
+
+	if currentCacheDir == "" {
+		return errors.Errorf("could not find cache work_dir in daemon config")
+	}
+
+	// The cache directory in config might not be daemon-specific yet
+	// Check if it already has the daemon ID, if not append it
+	if !strings.HasSuffix(currentCacheDir, daemonID) {
+		currentCacheDir = filepath.Join(currentCacheDir, daemonID)
+		log.G(ctx).Infof("Appended daemon ID to cache dir: %s", currentCacheDir)
+	}
+
+	// Check if we've already bind mounted for this daemon
+	bindMountMarker := filepath.Join(cachePvcPath, ".nydus-cache-mounted-" + daemonID)
+	if _, err := os.Stat(bindMountMarker); err == nil {
+		log.G(ctx).Infof("Cache already bind mounted for daemon %s, skipping", daemonID)
+		return nil
+	}
+
+	// Create daemon-specific cache directory on the PVC
+	// This should match the structure of currentCacheDir
+	// If currentCacheDir is /mnt/nydus/cache/daemonID, create similar structure on PVC
+	pvcCacheDir := filepath.Join(cachePvcPath, "cache", daemonID)
+	if err := os.MkdirAll(pvcCacheDir, 0755); err != nil {
+		return errors.Wrapf(err, "failed to create cache directory %s", pvcCacheDir)
+	}
+
+	// Perform the bind mount
+	// Mount the PVC cache directory over the daemon's current cache directory
+	log.G(ctx).Infof("Bind mounting daemon-specific cache from %s to %s for daemon %s", pvcCacheDir, currentCacheDir, daemonID)
+
+	// First ensure the current cache directory exists
+	if err := os.MkdirAll(currentCacheDir, 0755); err != nil {
+		return errors.Wrapf(err, "failed to create current cache directory %s", currentCacheDir)
+	}
+
+	mountCmd := exec.Command("mount", "--bind", pvcCacheDir, currentCacheDir)
+	if output, err := mountCmd.CombinedOutput(); err != nil {
+		// Check if it's already mounted
+		if strings.Contains(string(output), "already mounted") || strings.Contains(string(output), "mount point busy") {
+			log.G(ctx).Infof("Cache directory already mounted, continuing")
+		} else {
+			return errors.Wrapf(err, "failed to bind mount cache directory: %s", string(output))
+		}
+	}
+
+	// Create marker file to indicate this daemon's cache has been mounted
+	if err := os.WriteFile(bindMountMarker, []byte(time.Now().String()), 0644); err != nil {
+		log.G(ctx).Warnf("Failed to create bind mount marker: %v", err)
+	}
+
+	log.G(ctx).Infof("Successfully bind mounted cache to PVC for daemon %s", daemonID)
+	return nil
 }
 

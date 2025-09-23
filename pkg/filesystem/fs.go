@@ -333,7 +333,9 @@ func (fs *Filesystem) Mount(ctx context.Context, snapshotID string, labels map[s
 
 		// Nydusd uses cache manager's directory to store blob caches. So cache
 		// manager knows where to find those blobs.
-		cacheDir := fs.cacheMgr.CacheDir()
+		// Append daemon ID to make cache directory unique per daemon
+		baseCacheDir := fs.cacheMgr.CacheDir()
+		cacheDir := path.Join(baseCacheDir, d.ID())
 		// Fscache driver stores blob cache bitmap and blob header files here
 		workDir := rafs.FscacheWorkDir()
 		params := map[string]string{
