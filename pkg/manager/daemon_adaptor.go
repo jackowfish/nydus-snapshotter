@@ -155,9 +155,12 @@ func (m *Manager) BuildDaemonCommand(d *daemon.Daemon, bin string, upgrade bool)
 				return nil, errors.Wrapf(err, "locate bootstrap %s", bootstrap)
 			}
 
+			// Print what would have been passed as bootstrap but don't actually add it
+			log.L.Infof("[BOOTSTRAP REMOVED] Would have passed --bootstrap %s", bootstrap)
+
 			cmdOpts = append(cmdOpts,
 				command.WithConfig(d.ConfigFile("")),
-				command.WithBootstrap(bootstrap),
+				// command.WithBootstrap(bootstrap), // REMOVED: no longer passing --bootstrap
 			)
 			if config.IsBackendSourceEnabled() {
 				configAPIPath := fmt.Sprintf(endpointGetBackend, d.States.ID)
