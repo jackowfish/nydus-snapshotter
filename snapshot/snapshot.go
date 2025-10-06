@@ -9,6 +9,7 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1172,14 +1173,14 @@ func (o *snapshotter) containerBySnapshotKey(ctx context.Context, snapKey string
 	for _, ns := range nsList {
 		// Create context with namespace using containerd's namespaces package
 		nctx := namespaces.WithNamespace(ctx, ns)
-		
+
 		// List containers in this namespace
 		containerList, err := o.ctrd.ContainerService().List(nctx)
 		if err != nil {
 			// continue to next namespace rather than fail hard
 			continue
 		}
-		
+
 		for _, c := range containerList {
 			if c.SnapshotKey == snapKeyHash && (o.snapName == "" || c.Snapshotter == o.snapName) {
 				return ns, &c, nil
@@ -1240,7 +1241,7 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 	if _, err := os.Stat(containerWorkDir); err != nil {
 		return nil
 	}
-	
+
 	// Use host-native paths for overlay mount options
 	upperDir := filepath.Join(hostNativePvcPath, "upper")
 	workDir := filepath.Join(hostNativePvcPath, "work")
@@ -1276,13 +1277,13 @@ func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, contai
 	if container == nil {
 		return "", "", nil
 	}
-	
+
 	// Extract pod information from container labels
 	podName, ok := container.Labels["io.kubernetes.pod.name"]
 	if !ok {
 		return "", "", errors.New("container missing io.kubernetes.pod.name label")
 	}
-	
+
 	podNamespace, ok := container.Labels["io.kubernetes.pod.namespace"]
 	if !ok {
 		return "", "", errors.New("container missing io.kubernetes.pod.namespace label")
@@ -1326,7 +1327,7 @@ func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, contai
 	if overlayType == "" {
 		overlayType = "fuse-overlayfs" // default
 	}
-	
+
 	return pvcPath, overlayType, nil
 }
 
@@ -1334,40 +1335,62 @@ func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, contai
 func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, clientset *kubernetes.Clientset) (string, error) {
 	// Extract PVC names from pod volumes and get their bound volume names
 	var volumeNames []string
+	var pvList []*corev1.PersistentVolume
 	for _, volume := range pod.Spec.Volumes {
 		if volume.PersistentVolumeClaim != nil {
 			pvcName := volume.PersistentVolumeClaim.ClaimName
-			
+
 			// Get the actual volume name from the PVC using the passed clientset
 			pvc, err := clientset.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, pvcName, metav1.GetOptions{})
 			if err != nil {
 				continue
 			}
-			
+
 			if pvc.Spec.VolumeName != "" {
 				volumeNames = append(volumeNames, pvc.Spec.VolumeName)
+
+				// Get the PV to check if it's an EBS CSI volume
+				pv, err := clientset.CoreV1().PersistentVolumes().Get(ctx, pvc.Spec.VolumeName, metav1.GetOptions{})
+				if err != nil {
+					continue
+				}
+				pvList = append(pvList, pv)
 			}
 		}
 	}
-	
+
 	if len(volumeNames) == 0 {
 		return "", nil // No bound volumes found
 	}
-	
+
+	// Check if any PV is provisioned by EBS CSI
+	for _, pv := range pvList {
+		if pv.Annotations["pv.kubernetes.io/provisioned-by"] == "ebs.csi.aws.com" && pv.Spec.CSI != nil {
+			// Look for EBS CSI globalmount
+			mountPath, err := o.findEBSCSIMountPath(pv.Spec.CSI.VolumeHandle)
+			if err != nil {
+				return "", errors.Wrap(err, "failed to find EBS CSI mount path")
+			}
+			if mountPath != "" {
+				return mountPath, nil
+			}
+		}
+	}
+
 	// Read /host/proc/mounts directly from host
 	mountsData, err := os.ReadFile("/host/proc/mounts")
 	if err != nil {
 		return "", errors.Wrap(err, "failed to read /host/proc/mounts")
 	}
-	
+
 	// Parse mount data to find PVC mountpoints
 	lines := strings.Split(string(mountsData), "\n")
-	
+
 	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		
+
 		// Look for lines containing any volume name
 		for _, volumeName := range volumeNames {
 			if strings.Contains(line, volumeName) {
@@ -1375,7 +1398,7 @@ func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, cli
 				fields := strings.Fields(line)
 				if len(fields) >= 2 {
 					mountPath := fields[1]
-					
+
 					// Check if the volume name is also in the mount path (preferred)
 					if strings.Contains(mountPath, volumeName) {
 						// Filter out containerd-related mount paths
@@ -1390,7 +1413,63 @@ func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, cli
 			}
 		}
 	}
-	
+
 	return "", nil // No matching PVC mount found
 }
 
+// findEBSCSIMountPath finds the EBS CSI globalmount path by matching volumeHandle
+func (o *snapshotter) findEBSCSIMountPath(volumeHandle string) (string, error) {
+	// Read /host/proc/mounts to find globalmount entries
+	mountsData, err := os.ReadFile("/host/proc/mounts")
+	if err != nil {
+		return "", errors.Wrap(err, "failed to read /host/proc/mounts")
+	}
+
+	// Parse mount data to find globalmount paths
+	lines := strings.Split(string(mountsData), "\n")
+	var globalmountPaths []string
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// Look for lines containing "globalmount"
+		if strings.Contains(line, "globalmount") {
+			// Extract mount path (second field in /host/proc/mounts format)
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				mountPath := fields[1]
+				globalmountPaths = append(globalmountPaths, mountPath)
+			}
+		}
+	}
+
+	// Check each globalmount path for matching volumeHandle
+	for _, globalmountPath := range globalmountPaths {
+		// The vol_data.json is in the parent directory of globalmount
+		parentDir := filepath.Dir(globalmountPath)
+		volDataPath := filepath.Join(parentDir, "vol_data.json")
+
+		data, err := os.ReadFile(volDataPath)
+		if err != nil {
+			continue // File doesn't exist or can't be read, try next
+		}
+
+		// Parse the vol_data.json
+		var volData struct {
+			DriverName   string `json:"driverName"`
+			VolumeHandle string `json:"volumeHandle"`
+		}
+		if err := json.Unmarshal(data, &volData); err != nil {
+			continue // Invalid JSON, try next
+		}
+
+		// Check if volumeHandle matches
+		if volData.VolumeHandle == volumeHandle {
+			return globalmountPath, nil
+		}
+	}
+
+	return "", nil // No matching EBS CSI mount found
+}
