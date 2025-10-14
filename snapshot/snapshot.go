@@ -9,6 +9,7 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,15 +17,23 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/log"
 	"github.com/containerd/nydus-snapshotter/config"
 	"github.com/containerd/nydus-snapshotter/config/daemonconfig"
 	"github.com/containerd/nydus-snapshotter/pkg/rafs"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/containerd/nydus-snapshotter/pkg/cache"
 	"github.com/containerd/nydus-snapshotter/pkg/cgroup"
@@ -59,6 +68,8 @@ type snapshotter struct {
 	enableKataVolume     bool
 	syncRemove           bool
 	cleanupOnClose       bool
+	ctrd                 *client.Client // containerd client for container queries
+	snapName             string         // snapshotter name for filtering
 }
 
 func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapshots.Snapshotter, error) {
@@ -284,6 +295,13 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 		syncRemove = true
 	}
 
+	// Initialize containerd client for container queries
+	ctrdClient, err := client.New("/run/containerd/containerd.sock")
+	if err != nil {
+		log.L.WithError(err).Warn("Failed to initialize containerd client for container queries")
+		ctrdClient = nil // Continue without client, will fall back to old method
+	}
+
 	return &snapshotter{
 		root:                 cfg.Root,
 		nydusdPath:           cfg.DaemonConfig.NydusdPath,
@@ -295,6 +313,8 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 		nydusOverlayFSPath:   cfg.SnapshotsConfig.NydusOverlayFSPath,
 		enableKataVolume:     cfg.SnapshotsConfig.EnableKataVolume,
 		cleanupOnClose:       cfg.CleanupOnClose,
+		ctrd:                 ctrdClient,
+		snapName:             "nydus", // or get from config
 	}, nil
 }
 
@@ -845,6 +865,26 @@ func overlayMount(options []string) []mount.Mount {
 	}
 }
 
+func fuseOverlayMount(options []string) []mount.Mount {
+	return []mount.Mount{
+		{
+			Type:    "fuse.fuse-overlayfs",
+			Source:  "fuse-overlayfs",
+			Options: options,
+		},
+	}
+}
+
+func nydusOverlayMount(options []string) []mount.Mount {
+	return []mount.Mount{
+		{
+			Type:    "fuse.nydus-overlayfs",
+			Source:  "fuse.nydus-overlayfs",
+			Options: options,
+		},
+	}
+}
+
 // Handle proxy mount which the snapshot has been prepared by other snapshotter, mainly used for pause image in containerd
 func (o *snapshotter) mountProxy(ctx context.Context, s storage.Snapshot) ([]mount.Mount, error) {
 	var overlayOptions []string
@@ -940,6 +980,14 @@ func (o *snapshotter) mountRemote(ctx context.Context, labels map[string]string,
 	lowerDirOption := fmt.Sprintf("lowerdir=%s", strings.Join(lowerPaths, ":"))
 	overlayOptions = append(overlayOptions, lowerDirOption)
 	log.G(ctx).Infof("remote mount options %v", overlayOptions)
+
+	// Check for PVC annotation and replace overlay options if found
+	if o.ctrd != nil && s.Kind == snapshots.KindActive {
+		log.G(ctx).Infof("Checking for PVC mount annotation")
+		if mounts := o.tryPVMount(ctx, key, overlayOptions); mounts != nil {
+			return mounts, nil
+		}
+	}
 
 	if o.enableKataVolume {
 		return o.mountWithKataVolume(ctx, id, overlayOptions, key)
@@ -1097,4 +1145,331 @@ func treatAsProxyDriver(labels map[string]string) bool {
 	default:
 		return false
 	}
+}
+
+// containerBySnapshotKey finds the container whose rootfs SnapshotKey matches snapKey
+func (o *snapshotter) containerBySnapshotKey(ctx context.Context, snapKey string) (string, *containers.Container, error) {
+	if o.ctrd == nil {
+		return "", nil, errors.New("containerd client not initialized")
+	}
+
+	// Extract just the hash part from the snapshot key for comparison
+	// snapKey format: k8s.io/168/0dd9fdfc1fcebe970420b127d5df2fb28958df2464872adbb71c651135be9692
+	// container.SnapshotKey format: 0dd9fdfc1fcebe970420b127d5df2fb28958df2464872adbb71c651135be9692
+	snapKeyParts := strings.Split(snapKey, "/")
+	var snapKeyHash string
+	if len(snapKeyParts) >= 3 {
+		snapKeyHash = snapKeyParts[2] // Get the hash part
+	} else {
+		snapKeyHash = snapKey // fallback to full key if format is unexpected
+	}
+
+	// List namespaces, then containers in each
+	nsList, err := o.ctrd.NamespaceService().List(ctx)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "list namespaces")
+	}
+
+	for _, ns := range nsList {
+		// Create context with namespace using containerd's namespaces package
+		nctx := namespaces.WithNamespace(ctx, ns)
+
+		// List containers in this namespace
+		containerList, err := o.ctrd.ContainerService().List(nctx)
+		if err != nil {
+			// continue to next namespace rather than fail hard
+			continue
+		}
+
+		for _, c := range containerList {
+			if c.SnapshotKey == snapKeyHash && (o.snapName == "" || c.Snapshotter == o.snapName) {
+				return ns, &c, nil
+			}
+		}
+	}
+	return "", nil, errdefs.ErrNotFound
+}
+
+// tryPVMount attempts to create a PVC-based mount if the pod has the appropriate annotation
+func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions []string) []mount.Mount {
+	_, container, err := o.containerBySnapshotKey(ctx, key)
+	if err != nil || container == nil {
+		return nil
+	}
+
+	pvcPath, overlayType, err := o.getPodAnnotationsFromContainer(ctx, container)
+	if err != nil {
+		return nil
+	}
+
+	if pvcPath == "" {
+		return nil
+	}
+
+	log.G(ctx).Infof("Using PVC path from annotation: %s, overlay type: %s", pvcPath, overlayType)
+
+	// Separate container-accessible path from host-native path
+	var containerPvcPath, hostNativePvcPath string
+	if strings.HasPrefix(pvcPath, "/host") {
+		// Path found via /host/proc/mounts - we have the host-native path
+		hostNativePvcPath = strings.TrimPrefix(pvcPath, "/host")
+		containerPvcPath = pvcPath // Keep /host prefix for creating directories
+	} else {
+		// Path doesn't have /host prefix (shouldn't happen in our case, but handle it)
+		hostNativePvcPath = pvcPath
+		containerPvcPath = pvcPath
+	}
+
+	// Create upperdir and workdir paths under the PVC mount using container-accessible path
+	containerUpperDir := filepath.Join(containerPvcPath, "upper")
+	containerWorkDir := filepath.Join(containerPvcPath, "work")
+
+	// Ensure upperdir and workdir exist on the host filesystem
+	if err := os.MkdirAll(containerUpperDir, 0755); err != nil {
+		log.G(ctx).WithError(err).Errorf("Failed to create upperdir %s", containerUpperDir)
+		return nil
+	}
+	if err := os.MkdirAll(containerWorkDir, 0711); err != nil {
+		log.G(ctx).WithError(err).Errorf("Failed to create workdir %s", containerWorkDir)
+		return nil
+	}
+
+	// Verify directories were created successfully
+	if _, err := os.Stat(containerUpperDir); err != nil {
+		return nil
+	}
+	if _, err := os.Stat(containerWorkDir); err != nil {
+		return nil
+	}
+
+	// Use host-native paths for overlay mount options
+	upperDir := filepath.Join(hostNativePvcPath, "upper")
+	workDir := filepath.Join(hostNativePvcPath, "work")
+
+	// Remove existing upperdir/workdir options and add PVC-based paths
+	var newOptions []string
+	for _, option := range overlayOptions {
+		if !strings.HasPrefix(option, "upperdir=") && !strings.HasPrefix(option, "workdir=") {
+			newOptions = append(newOptions, option)
+		}
+	}
+	newOptions = append(newOptions,
+		fmt.Sprintf("upperdir=%s", upperDir),
+		fmt.Sprintf("workdir=%s", workDir),
+	)
+
+	log.G(ctx).Infof("Using PVC paths for overlay mount - upperdir=%s, workdir=%s, type=%s", upperDir, workDir, overlayType)
+
+	// Choose mount type based on overlay-type annotation
+	switch overlayType {
+	case "overlayfs":
+		return overlayMount(newOptions)
+	case "nydus-overlayfs":
+		return nydusOverlayMount(newOptions)
+	default:
+		// Default to fuse-overlayfs for backwards compatibility
+		return fuseOverlayMount(newOptions)
+	}
+}
+
+// getPodAnnotationsFromContainer extracts PVC path and overlay type from pod annotations
+func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, container *containers.Container) (pvcPath, overlayType string, err error) {
+	if container == nil {
+		return "", "", nil
+	}
+
+	// Extract pod information from container labels
+	podName, ok := container.Labels["io.kubernetes.pod.name"]
+	if !ok {
+		return "", "", errors.New("container missing io.kubernetes.pod.name label")
+	}
+
+	podNamespace, ok := container.Labels["io.kubernetes.pod.namespace"]
+	if !ok {
+		return "", "", errors.New("container missing io.kubernetes.pod.namespace label")
+	}
+
+	// Create in-cluster config
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return "", "", err
+	}
+
+	// Create Kubernetes client
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Get the specific pod directly
+	pod, err := clientset.CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return "", "", errors.Wrapf(err, "failed to get pod %s/%s", podNamespace, podName)
+	}
+
+	// Check if use-pvc-upper is enabled (boolean)
+	usePvcUpper := pod.Annotations["nydus/use-pvc-upper"]
+	if usePvcUpper != "true" {
+		return "", "", nil
+	}
+
+	// Find PVC mount directory
+	pvcPath, err = o.findPVCMountPath(ctx, pod, clientset)
+	if err != nil {
+		return "", "", errors.Wrap(err, "failed to find PVC mount path")
+	}
+	if pvcPath == "" {
+		return "", "", nil
+	}
+
+	// Get overlay type from annotation, default to fuse-overlayfs
+	overlayType = pod.Annotations["nydus/overlay-type"]
+	if overlayType == "" {
+		overlayType = "fuse-overlayfs" // default
+	}
+
+	return pvcPath, overlayType, nil
+}
+
+// findPVCMountPath finds the PVC mount directory by searching for mountpoints with PVC volume names
+func (o *snapshotter) findPVCMountPath(ctx context.Context, pod *corev1.Pod, clientset *kubernetes.Clientset) (string, error) {
+	// Extract PVC names from pod volumes and get their bound volume names
+	var volumeNames []string
+	var pvList []*corev1.PersistentVolume
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			pvcName := volume.PersistentVolumeClaim.ClaimName
+
+			// Get the actual volume name from the PVC using the passed clientset
+			pvc, err := clientset.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(ctx, pvcName, metav1.GetOptions{})
+			if err != nil {
+				continue
+			}
+
+			if pvc.Spec.VolumeName != "" {
+				volumeNames = append(volumeNames, pvc.Spec.VolumeName)
+
+				// Get the PV to check if it's an EBS CSI volume
+				pv, err := clientset.CoreV1().PersistentVolumes().Get(ctx, pvc.Spec.VolumeName, metav1.GetOptions{})
+				if err != nil {
+					continue
+				}
+				pvList = append(pvList, pv)
+			}
+		}
+	}
+
+	if len(volumeNames) == 0 {
+		return "", nil // No bound volumes found
+	}
+
+	// Check if any PV is provisioned by EBS CSI
+	for _, pv := range pvList {
+		if pv.Annotations["pv.kubernetes.io/provisioned-by"] == "ebs.csi.aws.com" && pv.Spec.CSI != nil {
+			// Look for EBS CSI globalmount
+			mountPath, err := o.findEBSCSIMountPath(pv.Spec.CSI.VolumeHandle)
+			if err != nil {
+				return "", errors.Wrap(err, "failed to find EBS CSI mount path")
+			}
+			if mountPath != "" {
+				return mountPath, nil
+			}
+		}
+	}
+
+	// Read /host/proc/mounts directly from host
+	mountsData, err := os.ReadFile("/host/proc/mounts")
+	if err != nil {
+		return "", errors.Wrap(err, "failed to read /host/proc/mounts")
+	}
+
+	// Parse mount data to find PVC mountpoints
+	lines := strings.Split(string(mountsData), "\n")
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// Look for lines containing any volume name
+		for _, volumeName := range volumeNames {
+			if strings.Contains(line, volumeName) {
+				// Extract mount path (second field in /host/proc/mounts format)
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					mountPath := fields[1]
+
+					// Check if the volume name is also in the mount path (preferred)
+					if strings.Contains(mountPath, volumeName) {
+						// Filter out containerd-related mount paths
+						if strings.Contains(mountPath, "containerd") {
+							continue
+						}
+						return mountPath, nil
+					} else {
+						continue // Volume name not in path, try next line
+					}
+				}
+			}
+		}
+	}
+
+	return "", nil // No matching PVC mount found
+}
+
+// findEBSCSIMountPath finds the EBS CSI globalmount path by matching volumeHandle
+func (o *snapshotter) findEBSCSIMountPath(volumeHandle string) (string, error) {
+	// Read /host/proc/mounts to find globalmount entries
+	mountsData, err := os.ReadFile("/host/proc/mounts")
+	if err != nil {
+		return "", errors.Wrap(err, "failed to read /host/proc/mounts")
+	}
+
+	// Parse mount data to find globalmount paths
+	lines := strings.Split(string(mountsData), "\n")
+	var globalmountPaths []string
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// Look for lines containing "globalmount"
+		if strings.Contains(line, "globalmount") {
+			// Extract mount path (second field in /host/proc/mounts format)
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				mountPath := fields[1]
+				globalmountPaths = append(globalmountPaths, mountPath)
+			}
+		}
+	}
+
+	// Check each globalmount path for matching volumeHandle
+	for _, globalmountPath := range globalmountPaths {
+		// The vol_data.json is in the parent directory of globalmount
+		parentDir := filepath.Dir(globalmountPath)
+		volDataPath := filepath.Join(parentDir, "vol_data.json")
+
+		data, err := os.ReadFile(volDataPath)
+		if err != nil {
+			continue // File doesn't exist or can't be read, try next
+		}
+
+		// Parse the vol_data.json
+		var volData struct {
+			DriverName   string `json:"driverName"`
+			VolumeHandle string `json:"volumeHandle"`
+		}
+		if err := json.Unmarshal(data, &volData); err != nil {
+			continue // Invalid JSON, try next
+		}
+
+		// Check if volumeHandle matches
+		if volData.VolumeHandle == volumeHandle {
+			return globalmountPath, nil
+		}
+	}
+
+	return "", nil // No matching EBS CSI mount found
 }
