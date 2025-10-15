@@ -1273,94 +1273,34 @@ func (o *snapshotter) labelFirstSnapshotForReuse(ctx context.Context, key string
 	}
 }
 
-// handleSnapshotReuse moves existing snapshot directories to the new snapshot location and updates the pod annotation
-func (o *snapshotter) handleSnapshotReuse(ctx context.Context, key string, container *containers.Container, oldSnapshotDir string, overlayOptions []string) []mount.Mount {
-	// Extract the old snapshot ID from the path (e.g., /root/snapshots/123/fs -> 123)
-	parts := strings.Split(filepath.Clean(oldSnapshotDir), string(filepath.Separator))
-	var oldSnapshotID string
+// handleSnapshotReuse reuses the existing snapshot directories from the first container
+func (o *snapshotter) handleSnapshotReuse(ctx context.Context, reuseSnapshotDir string, overlayOptions []string) []mount.Mount {
+	// Extract the snapshot ID from the reused directory path (e.g., /root/snapshots/123/fs -> 123)
+	parts := strings.Split(filepath.Clean(reuseSnapshotDir), string(filepath.Separator))
+	var reuseSnapshotID string
 	for i, part := range parts {
 		if part == "snapshots" && i+1 < len(parts) {
-			oldSnapshotID = parts[i+1]
+			reuseSnapshotID = parts[i+1]
 			break
 		}
 	}
 
-	if oldSnapshotID == "" {
-		log.G(ctx).Errorf("Failed to extract snapshot ID from path: %s", oldSnapshotDir)
+	if reuseSnapshotID == "" {
+		log.G(ctx).Errorf("Failed to extract snapshot ID from path: %s", reuseSnapshotDir)
 		return nil
 	}
 
-	// Get the new snapshot ID
-	newSnapshotID, _, _, err := snapshot.GetSnapshotInfo(ctx, o.ms, key)
-	if err != nil {
-		log.G(ctx).WithError(err).Errorf("Failed to get new snapshot info for key %s", key)
-		return nil
-	}
+	// Reuse all directories from the first snapshot: upper, work, and lower
+	upperDir := o.upperPath(reuseSnapshotID)
+	workDir := o.workPath(reuseSnapshotID)
 
-	// Define old and new paths
-	oldUpperDir := o.upperPath(oldSnapshotID)
-	oldWorkDir := o.workPath(oldSnapshotID)
-	newUpperDir := o.upperPath(newSnapshotID)
-	newWorkDir := o.workPath(newSnapshotID)
-
-	// Check if old directories exist
-	oldUpperExists := true
-	oldWorkExists := true
-	if _, err := os.Stat(oldUpperDir); os.IsNotExist(err) {
-		log.G(ctx).Warnf("Old upper dir %s doesn't exist, will use new snapshot directories", oldUpperDir)
-		oldUpperExists = false
-	}
-	if _, err := os.Stat(oldWorkDir); os.IsNotExist(err) {
-		log.G(ctx).Warnf("Old work dir %s doesn't exist, will use new snapshot directories", oldWorkDir)
-		oldWorkExists = false
-	}
-
-	// If old directories don't exist, just use the new ones
-	if !oldUpperExists || !oldWorkExists {
-		log.G(ctx).Infof("Using newly created snapshot directories for snapshot ID %s", newSnapshotID)
-		// Update the pod annotation with the new snapshot directory
-		if err := o.labelPodWithSnapshotDir(ctx, container, newUpperDir); err != nil {
-			log.G(ctx).WithError(err).Warnf("Failed to update pod annotation with new snapshot dir")
-		}
-		// Fall through to construct overlay options with new directories
-	} else {
-		log.G(ctx).Infof("Moving snapshot directories from %s to %s", oldSnapshotID, newSnapshotID)
-
-		// Remove the newly created empty directories
-		if err := os.RemoveAll(newUpperDir); err != nil {
-			log.G(ctx).WithError(err).Warnf("Failed to remove new upper dir %s", newUpperDir)
-		}
-		if err := os.RemoveAll(newWorkDir); err != nil {
-			log.G(ctx).WithError(err).Warnf("Failed to remove new work dir %s", newWorkDir)
-		}
-
-		// Move the old directories to the new location
-		if err := os.Rename(oldUpperDir, newUpperDir); err != nil {
-			log.G(ctx).WithError(err).Errorf("Failed to move upper dir from %s to %s", oldUpperDir, newUpperDir)
-			return nil
-		}
-		if err := os.Rename(oldWorkDir, newWorkDir); err != nil {
-			log.G(ctx).WithError(err).Errorf("Failed to move work dir from %s to %s", oldWorkDir, newWorkDir)
-			// Try to move upper back if work move failed
-			os.Rename(newUpperDir, oldUpperDir)
-			return nil
-		}
-
-		log.G(ctx).Infof("Moved snapshot directories to new snapshot ID %s", newSnapshotID)
-
-		// Update the pod annotation with the new snapshot directory
-		if err := o.labelPodWithSnapshotDir(ctx, container, newUpperDir); err != nil {
-			log.G(ctx).WithError(err).Warnf("Failed to update pod annotation with new snapshot dir")
-		}
-	}
-
-	// Construct overlay options with the new directories
+	// Construct overlay options with all reused directories
 	newOptions := []string{
-		fmt.Sprintf("upperdir=%s", newUpperDir),
-		fmt.Sprintf("workdir=%s", newWorkDir),
+		fmt.Sprintf("upperdir=%s", upperDir),
+		fmt.Sprintf("workdir=%s", workDir),
 	}
 
-	// Append the lowerdir from original overlay options
+	// Append the lowerdir from original overlay options (which should be the same)
 	for _, opt := range overlayOptions {
 		if strings.HasPrefix(opt, "lowerdir=") {
 			newOptions = append(newOptions, opt)
@@ -1368,7 +1308,7 @@ func (o *snapshotter) handleSnapshotReuse(ctx context.Context, key string, conta
 		}
 	}
 
-	log.G(ctx).Infof("Moved snapshot directories to new snapshot ID %s: upper=%s, work=%s", newSnapshotID, newUpperDir, newWorkDir)
+	log.G(ctx).Infof("Reusing snapshot directories from snapshot ID %s: upper=%s, work=%s", reuseSnapshotID, upperDir, workDir)
 
 	return overlayMount(newOptions)
 }
@@ -1387,7 +1327,7 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 
 	// Handle snapshot reuse case
 	if reuseSnapshotPath != "" {
-		return o.handleSnapshotReuse(ctx, key, container, reuseSnapshotPath, overlayOptions)
+		return o.handleSnapshotReuse(ctx, reuseSnapshotPath, overlayOptions)
 	}
 
 	// If pvcPath is empty but we got here, check if we need to label for snapshot reuse
@@ -1505,18 +1445,16 @@ func (o *snapshotter) labelPodWithSnapshotDir(ctx context.Context, container *co
 		return nil // Nothing to do if reuse is not enabled
 	}
 
-	// Check if pod already has the annotation and if it's the same
-	if existingDir, ok := pod.Annotations["nydus/snapshot-dir"]; ok && existingDir == snapshotDir {
-		log.G(ctx).Debugf("Pod %s/%s already has correct snapshot dir annotation: %s", podNamespace, podName, existingDir)
+	// Check if pod already has the annotation
+	if existingDir, ok := pod.Annotations["nydus/snapshot-dir"]; ok && existingDir != "" {
+		log.G(ctx).Debugf("Pod %s/%s already annotated with snapshot dir: %s", podNamespace, podName, existingDir)
 		return nil
 	}
 
-	// Update the annotation with the snapshot directory
+	// Annotate the pod with the snapshot directory
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
-
-	oldDir := pod.Annotations["nydus/snapshot-dir"]
 	pod.Annotations["nydus/snapshot-dir"] = snapshotDir
 
 	_, err = clientset.CoreV1().Pods(podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
@@ -1524,11 +1462,7 @@ func (o *snapshotter) labelPodWithSnapshotDir(ctx context.Context, container *co
 		return errors.Wrapf(err, "failed to update pod %s/%s with snapshot dir annotation", podNamespace, podName)
 	}
 
-	if oldDir != "" {
-		log.G(ctx).Infof("Updated pod %s/%s snapshot dir annotation from %s to %s", podNamespace, podName, oldDir, snapshotDir)
-	} else {
-		log.G(ctx).Infof("Successfully annotated pod %s/%s with snapshot dir: %s", podNamespace, podName, snapshotDir)
-	}
+	log.G(ctx).Infof("Successfully annotated pod %s/%s with snapshot dir: %s", podNamespace, podName, snapshotDir)
 	return nil
 }
 
