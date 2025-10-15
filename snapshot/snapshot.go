@@ -1051,6 +1051,59 @@ func (o *snapshotter) prepareDirectory(snapshotDir string, kind snapshots.Kind) 
 	return td, nil
 }
 
+// getReferencedSnapshotDirs returns a map of snapshot directories that are referenced in pod annotations
+func (o *snapshotter) getReferencedSnapshotDirs(ctx context.Context) map[string]bool {
+	referencedDirs := make(map[string]bool)
+
+	// Create in-cluster config
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.G(ctx).WithError(err).Warnf("Failed to create in-cluster config for cleanup check")
+		return referencedDirs
+	}
+
+	// Create Kubernetes client
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.G(ctx).WithError(err).Warnf("Failed to create Kubernetes client for cleanup check")
+		return referencedDirs
+	}
+
+	// Get the current node name from environment variable (try NODE_NAME first, fall back to HOSTNAME)
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		nodeName = os.Getenv("HOSTNAME")
+	}
+	if nodeName == "" {
+		log.G(ctx).Warnf("Neither NODE_NAME nor HOSTNAME environment variable set, skipping pod annotation check")
+		return referencedDirs
+	}
+
+	// List pods in default namespace with label app=thunder-client on this node
+	listOptions := metav1.ListOptions{
+		LabelSelector: "app=thunder-client",
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+	}
+
+	pods, err := clientset.CoreV1().Pods("default").List(ctx, listOptions)
+	if err != nil {
+		log.G(ctx).WithError(err).Warnf("Failed to list pods for cleanup check")
+		return referencedDirs
+	}
+
+	// Check each pod for nydus/snapshot-dir annotation
+	for _, pod := range pods.Items {
+		if snapshotDir, ok := pod.Annotations["nydus/snapshot-dir"]; ok && snapshotDir != "" {
+			// Extract the parent directory (e.g., /path/snapshots/123/fs -> /path/snapshots/123)
+			parentDir := filepath.Dir(snapshotDir)
+			referencedDirs[parentDir] = true
+			log.G(ctx).Debugf("Pod %s/%s references snapshot dir: %s", pod.Namespace, pod.Name, parentDir)
+		}
+	}
+
+	return referencedDirs
+}
+
 func (o *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, error) {
 	ids, err := storage.IDMap(ctx)
 	if err != nil {
@@ -1074,13 +1127,25 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 	}
 
 	cleanup := make([]string, 0, 16)
+
+	// Get snapshot directories that are referenced in pod annotations
+	referencedDirs := o.getReferencedSnapshotDirs(ctx)
+
 	for _, d := range dirs {
 		if _, ok := ids[d]; ok {
 			continue
 		}
+
+		// Check if this directory is referenced by any pod annotation
+		dirPath := o.snapshotDir(d)
+		if _, isReferenced := referencedDirs[dirPath]; isReferenced {
+			log.G(ctx).Infof("Skipping cleanup of snapshot dir %s - referenced by pod annotation", dirPath)
+			continue
+		}
+
 		// When it quits, there will be nothing inside
 		// TODO: try to clean up config/sockets/logs directories
-		cleanup = append(cleanup, o.snapshotDir(d))
+		cleanup = append(cleanup, dirPath)
 	}
 	return cleanup, nil
 }
@@ -1238,31 +1303,55 @@ func (o *snapshotter) handleSnapshotReuse(ctx context.Context, key string, conta
 	newUpperDir := o.upperPath(newSnapshotID)
 	newWorkDir := o.workPath(newSnapshotID)
 
-	log.G(ctx).Infof("Moving snapshot directories from %s to %s", oldSnapshotID, newSnapshotID)
-
-	// Remove the newly created empty directories
-	if err := os.RemoveAll(newUpperDir); err != nil {
-		log.G(ctx).WithError(err).Warnf("Failed to remove new upper dir %s", newUpperDir)
+	// Check if old directories exist
+	oldUpperExists := true
+	oldWorkExists := true
+	if _, err := os.Stat(oldUpperDir); os.IsNotExist(err) {
+		log.G(ctx).Warnf("Old upper dir %s doesn't exist, will use new snapshot directories", oldUpperDir)
+		oldUpperExists = false
 	}
-	if err := os.RemoveAll(newWorkDir); err != nil {
-		log.G(ctx).WithError(err).Warnf("Failed to remove new work dir %s", newWorkDir)
-	}
-
-	// Move the old directories to the new location
-	if err := os.Rename(oldUpperDir, newUpperDir); err != nil {
-		log.G(ctx).WithError(err).Errorf("Failed to move upper dir from %s to %s", oldUpperDir, newUpperDir)
-		return nil
-	}
-	if err := os.Rename(oldWorkDir, newWorkDir); err != nil {
-		log.G(ctx).WithError(err).Errorf("Failed to move work dir from %s to %s", oldWorkDir, newWorkDir)
-		// Try to move upper back if work move failed
-		os.Rename(newUpperDir, oldUpperDir)
-		return nil
+	if _, err := os.Stat(oldWorkDir); os.IsNotExist(err) {
+		log.G(ctx).Warnf("Old work dir %s doesn't exist, will use new snapshot directories", oldWorkDir)
+		oldWorkExists = false
 	}
 
-	// Update the pod annotation with the new snapshot directory
-	if err := o.labelPodWithSnapshotDir(ctx, container, newUpperDir); err != nil {
-		log.G(ctx).WithError(err).Warnf("Failed to update pod annotation with new snapshot dir")
+	// If old directories don't exist, just use the new ones
+	if !oldUpperExists || !oldWorkExists {
+		log.G(ctx).Infof("Using newly created snapshot directories for snapshot ID %s", newSnapshotID)
+		// Update the pod annotation with the new snapshot directory
+		if err := o.labelPodWithSnapshotDir(ctx, container, newUpperDir); err != nil {
+			log.G(ctx).WithError(err).Warnf("Failed to update pod annotation with new snapshot dir")
+		}
+		// Fall through to construct overlay options with new directories
+	} else {
+		log.G(ctx).Infof("Moving snapshot directories from %s to %s", oldSnapshotID, newSnapshotID)
+
+		// Remove the newly created empty directories
+		if err := os.RemoveAll(newUpperDir); err != nil {
+			log.G(ctx).WithError(err).Warnf("Failed to remove new upper dir %s", newUpperDir)
+		}
+		if err := os.RemoveAll(newWorkDir); err != nil {
+			log.G(ctx).WithError(err).Warnf("Failed to remove new work dir %s", newWorkDir)
+		}
+
+		// Move the old directories to the new location
+		if err := os.Rename(oldUpperDir, newUpperDir); err != nil {
+			log.G(ctx).WithError(err).Errorf("Failed to move upper dir from %s to %s", oldUpperDir, newUpperDir)
+			return nil
+		}
+		if err := os.Rename(oldWorkDir, newWorkDir); err != nil {
+			log.G(ctx).WithError(err).Errorf("Failed to move work dir from %s to %s", oldWorkDir, newWorkDir)
+			// Try to move upper back if work move failed
+			os.Rename(newUpperDir, oldUpperDir)
+			return nil
+		}
+
+		log.G(ctx).Infof("Moved snapshot directories to new snapshot ID %s", newSnapshotID)
+
+		// Update the pod annotation with the new snapshot directory
+		if err := o.labelPodWithSnapshotDir(ctx, container, newUpperDir); err != nil {
+			log.G(ctx).WithError(err).Warnf("Failed to update pod annotation with new snapshot dir")
+		}
 	}
 
 	// Construct overlay options with the new directories
@@ -1416,16 +1505,18 @@ func (o *snapshotter) labelPodWithSnapshotDir(ctx context.Context, container *co
 		return nil // Nothing to do if reuse is not enabled
 	}
 
-	// Check if pod already has the annotation
-	if existingDir, ok := pod.Annotations["nydus/snapshot-dir"]; ok && existingDir != "" {
-		log.G(ctx).Infof("Pod %s/%s already annotated with snapshot dir: %s", podNamespace, podName, existingDir)
+	// Check if pod already has the annotation and if it's the same
+	if existingDir, ok := pod.Annotations["nydus/snapshot-dir"]; ok && existingDir == snapshotDir {
+		log.G(ctx).Debugf("Pod %s/%s already has correct snapshot dir annotation: %s", podNamespace, podName, existingDir)
 		return nil
 	}
 
-	// Annotate the pod with the snapshot directory
+	// Update the annotation with the snapshot directory
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
+
+	oldDir := pod.Annotations["nydus/snapshot-dir"]
 	pod.Annotations["nydus/snapshot-dir"] = snapshotDir
 
 	_, err = clientset.CoreV1().Pods(podNamespace).Update(ctx, pod, metav1.UpdateOptions{})
@@ -1433,7 +1524,11 @@ func (o *snapshotter) labelPodWithSnapshotDir(ctx context.Context, container *co
 		return errors.Wrapf(err, "failed to update pod %s/%s with snapshot dir annotation", podNamespace, podName)
 	}
 
-	log.G(ctx).Infof("Successfully annotated pod %s/%s with snapshot dir: %s", podNamespace, podName, snapshotDir)
+	if oldDir != "" {
+		log.G(ctx).Infof("Updated pod %s/%s snapshot dir annotation from %s to %s", podNamespace, podName, oldDir, snapshotDir)
+	} else {
+		log.G(ctx).Infof("Successfully annotated pod %s/%s with snapshot dir: %s", podNamespace, podName, snapshotDir)
+	}
 	return nil
 }
 
